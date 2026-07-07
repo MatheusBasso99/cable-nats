@@ -7,6 +7,13 @@ publish/subscribe — the same at-most-once, fire-and-forget delivery semantics 
 pub/sub, so it is a drop-in alternative to
 [cable-redis](https://github.com/cable-cr/cable-redis). No JetStream required.
 
+> [!WARNING]
+> **Experimental — not production tested.** This adapter is an experimental proof of
+> concept generated with Fable 5 and has not yet been exercised in a real production
+> workload. For that reason, no pull request has been opened against the upstream
+> repository yet. Use it at your own risk and validate it thoroughly before relying on
+> it in production.
+
 ## Installation
 
 1. Add the dependency to your `shard.yml`:
