@@ -1,6 +1,8 @@
 require "spec"
+require "log/spec"
 require "cable"
 require "../src/cable-nats"
+require "./support/*"
 
 Cable.configure do |settings|
   settings.route = "/updates"
