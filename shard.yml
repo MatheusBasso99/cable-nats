@@ -17,16 +17,8 @@ development_dependencies:
     branch: master
     # version: ~> 0.4
 
-  webmock:
-    github: manastech/webmock.cr
-    branch: master
-
   ameba:
     github: crystal-ameba/ameba
     version: ~> 1.6.4
-
-  timecop:
-    github: crystal-community/timecop.cr
-    version: ~> 0.5.0
 
 license: MIT
