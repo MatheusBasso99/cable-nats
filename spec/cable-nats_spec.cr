@@ -214,44 +214,39 @@ describe Cable::NATSBackend do
 
   describe "reconnection" do
     it "keeps streaming after the NATS server restarts", tags: "reconnect" do
-      pending!("docker is required for the reconnection spec") unless docker_available?
+      with_restartable_nats do |url, restart_server|
+        original_url = Cable.settings.url
 
-      container = "cable-nats-spec-reconnect"
-      docker("rm", "-f", container)
-      docker!("run", "-d", "--rm", "--name", container, "-p", "14222:4222", "nats:latest")
-      original_url = Cable.settings.url
+        begin
+          Cable.settings.url = url
+          Cable.restart
 
-      begin
-        wait_for_port(14222)
-        Cable.settings.url = "nats://localhost:14222"
-        Cable.restart
+          connect do |connection, socket|
+            identifier = {channel: "ChatChannel", room: "1"}.to_json
+            connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
+            wait_for { socket.messages.includes?(confirmation(identifier)) }
 
-        connect do |connection, socket|
-          identifier = {channel: "ChatChannel", room: "1"}.to_json
-          connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
-          wait_for { socket.messages.includes?(confirmation(identifier)) }
+            settle_subscriptions
+            Cable.server.publish(channel: "chat_1", message: %({"n": 1}))
+            wait_for { socket.messages.includes?(stream_message(identifier, %({"n": 1}))) }
 
-          settle_subscriptions
-          Cable.server.publish(channel: "chat_1", message: %({"n": 1}))
-          wait_for { socket.messages.includes?(stream_message(identifier, %({"n": 1}))) }
+            restart_server.call
 
-          docker!("restart", container)
-          wait_for_port(14222)
-          # Give the client a moment to notice the drop and resubscribe before
-          # writing again, then retry until a publish lands.
-          sleep 2.seconds
-          wait_for(timeout: 30.seconds) do
-            Cable.server.publish(channel: "chat_1", message: %({"n": 2}))
-            sleep 1.second
-            socket.messages.includes?(stream_message(identifier, %({"n": 2})))
+            # The client needs a beat to notice the drop, reconnect, and
+            # resubscribe; publishes are fire-and-forget, so retry until one
+            # lands on the resubscribed stream.
+            wait_for(timeout: 30.seconds) do
+              Cable.server.publish(channel: "chat_1", message: %({"n": 2}))
+              sleep 100.milliseconds
+              socket.messages.includes?(stream_message(identifier, %({"n": 2})))
+            end
           end
+        ensure
+          # Restore and restart while the server is still reachable so the
+          # old client can shut down cleanly.
+          Cable.settings.url = original_url
+          Cable.restart
         end
-      ensure
-        # Restore and restart while the container is still reachable so the
-        # old client can shut down cleanly, then tear the container down.
-        Cable.settings.url = original_url
-        Cable.restart
-        docker("rm", "-f", container)
       end
     end
   end
@@ -309,6 +304,40 @@ private def settle_subscriptions
   client = Cable.server.backend_publish
   Fiber.yield
   client.flush
+end
+
+# Yields a NATS URL plus a proc that restarts the server behind it, dropping
+# every connection. Against the default in-process backend this restarts a
+# dedicated `FakeNATSServer`; in integration mode (`CABLE_BACKEND_URL` set) it
+# restarts a Docker container running the real `nats-server`.
+private def with_restartable_nats(&)
+  if BackendEnvironment.integration?
+    pending!("docker is required for the reconnection spec in integration mode") unless docker_available?
+
+    container = "cable-nats-spec-reconnect"
+    docker("rm", "-f", container)
+    docker!("run", "-d", "--rm", "--name", container, "-p", "14222:4222", "nats:latest")
+
+    begin
+      wait_for_port(14222)
+      yield "nats://localhost:14222", -> do
+        docker!("restart", container)
+        wait_for_port(14222)
+        # Give the client a moment to notice the drop before writing again.
+        sleep 2.seconds
+      end
+    ensure
+      docker("rm", "-f", container)
+    end
+  else
+    server = FakeNATSServer.new
+
+    begin
+      yield "nats://127.0.0.1:#{server.port}", -> { server.restart }
+    ensure
+      server.stop
+    end
+  end
 end
 
 private def wait_for(timeout : Time::Span = 5.seconds, &)

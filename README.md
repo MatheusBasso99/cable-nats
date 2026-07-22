@@ -102,13 +102,26 @@ so anything built on `cable-redis` behaves the same here.
 
 ## Development
 
-Specs need a running NATS server (the reconnection spec also needs Docker):
+`crystal spec` is fully self-contained — no NATS server, Docker, or any other
+external service is required. The suite boots an in-process fake NATS server
+(`spec/support/fake_nats_server.cr`) that speaks enough of the NATS wire
+protocol for the real `NATS::Client` to connect, subscribe, publish, and
+reconnect against it:
 
 ```sh
-docker run --rm -p 4222:4222 nats:latest
+crystal spec
 ```
 
-Override the URL with `CABLE_BACKEND_URL` (default `nats://localhost:4222`).
+To run the same suite against a real NATS server instead (integration mode),
+point `CABLE_BACKEND_URL` at one:
+
+```sh
+docker run --rm -d -p 4222:4222 nats:latest
+CABLE_BACKEND_URL=nats://localhost:4222 crystal spec
+```
+
+In integration mode the reconnection spec restarts a real `nats-server` inside
+a Docker container; it is marked pending when Docker is unavailable.
 
 1. Make the update
 2. Add a spec and run `crystal spec`

@@ -7,9 +7,8 @@ on:
     branches: "*"
 
 jobs:
+  # Self-contained: specs run against the in-process fake NATS server.
   specs:
-    env:
-      CABLE_BACKEND_URL: nats://
     strategy:
       fail-fast: false
       matrix:
@@ -39,5 +38,26 @@ jobs:
         run: crystal tool format --check
       - name: Lint
         run: ./bin/ameba
+      - name: Run tests
+        run: crystal spec
+
+  # Integration: the same suite against a real nats-server.
+  integration:
+    runs-on: ubuntu-latest
+    container: crystallang/crystal:latest
+    services:
+      nats:
+        image: nats:latest
+    env:
+      CABLE_BACKEND_URL: nats://nats:4222
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Crystal
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/crystal
+          key: ${{ runner.os }}-crystal-integration
+      - name: Install shards
+        run: shards install
       - name: Run tests
         run: crystal spec
