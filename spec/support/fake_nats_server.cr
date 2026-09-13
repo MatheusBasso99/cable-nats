@@ -53,6 +53,9 @@ class FakeNATSServer
   @listener : TCPServer
   @connections = [] of Connection
   @mutex = Mutex.new
+  @ping_count = Atomic(Int32).new(0)
+  @mute_pongs = false
+  @held_pongs = [] of Connection
 
   # Binds to 127.0.0.1 on `port` (0 picks a free ephemeral port) and starts
   # accepting connections immediately.
@@ -62,12 +65,33 @@ class FakeNATSServer
     listen
   end
 
+  # Number of `PING` commands received from any client since the server
+  # started. Each `NATS::Client#flush` sends exactly one.
+  def ping_count : Int32
+    @ping_count.get
+  end
+
+  # While muted, `PING` is still read and counted but its `PONG` is held back,
+  # the way a stalled server would behave, so client flushes time out. Unmuting
+  # sends every held `PONG`: dropping them instead would leave the client's
+  # queue of pending flushes one reply behind for the rest of the connection.
+  def mute_pongs=(mute : Bool) : Nil
+    held = @mutex.synchronize do
+      @mute_pongs = mute
+      next [] of Connection if mute
+
+      @held_pongs.dup.tap { @held_pongs.clear }
+    end
+    held.each(&.send_line("PONG"))
+  end
+
   # Closes the listener and drops every open client connection.
   def stop : Nil
     @listener.close rescue nil
     @mutex.synchronize do
       @connections.each(&.close)
       @connections.clear
+      @held_pongs.clear
     end
   end
 
@@ -110,7 +134,12 @@ class FakeNATSServer
   private def handle_command(line : String, connection : Connection, socket : TCPSocket) : Nil
     case line
     when "PING"
-      connection.send_line "PONG"
+      @ping_count.add(1)
+      held = @mutex.synchronize do
+        @held_pongs << connection if @mute_pongs
+        @mute_pongs
+      end
+      connection.send_line "PONG" unless held
     when .starts_with?("SUB ")
       # SUB <subject> [queue group] <sid>
       tokens = line.split(' ')

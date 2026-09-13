@@ -20,7 +20,7 @@ module Cable
   # end
   # ```
   class NATSBackend < Cable::BackendCore
-    VERSION = "0.1.0"
+    VERSION = "0.1.1"
 
     register "nats" # nats://
     register "tls"  # tls:// (NATS over TLS)
@@ -33,10 +33,32 @@ module Cable
 
     private getter client : NATS::Client = NATS::Client.new(URI.parse(Cable.settings.url))
 
+    # How long this backend waits for the server to answer a PING: the round
+    # trip that confirms new subscriptions in `#subscribe`, and the keepalive
+    # checks in `#ping_subscribe_connection`/`#ping_publish_connection`.
+    FLUSH_TIMEOUT = 2.seconds
+
+    # A PING written to confirm subscriptions. The server handles a
+    # connection's commands in order, so its PONG proves every SUB numbered up
+    # to `covers` has been registered.
+    private class RoundTrip
+      getter covers : Int64
+      getter done = ::Channel(Nil).new
+      property error : Exception?
+
+      def initialize(@covers : Int64)
+      end
+    end
+
     @subscriptions = {} of String => NATS::Subscription
     @subscriptions_mutex = Mutex.new
     @closed = false
     @shutdown_signal = ::Channel(Nil).new
+    @ping_mutex = Mutex.new
+    @confirm_mutex = Mutex.new
+    @subscribed_seq = 0_i64
+    @confirmed_seq = 0_i64
+    @round_trip : RoundTrip?
 
     # Encodes a Cable stream identifier into a valid NATS subject by
     # percent-encoding reserved subject characters (`.`, `*`, `>`, `%`) and
@@ -125,10 +147,18 @@ module Cable
     # Starts streaming `stream_identifier`, forwarding each message to the
     # server's fiber channel as a `{stream_identifier, body}` tuple. The
     # `NATS::Subscription` is tracked so `#unsubscribe` can cancel it later.
+    #
+    # The client only buffers `SUB`, and Cable confirms the subscription to the
+    # WebSocket client as soon as this returns, so a new subscription waits for
+    # a PING/PONG round trip first: the `PONG` proves the server registered the
+    # interest, and a publish from any other process now reaches this node.
+    # Identifiers this node already streams return without a round trip. The
+    # guarantee covers the server this client is connected to; in a cluster,
+    # interest reaches the other servers asynchronously.
     def subscribe(stream_identifier : String)
       return if @closed
 
-      @subscriptions_mutex.synchronize do
+      seq = @subscriptions_mutex.synchronize do
         next if @subscriptions.has_key?(stream_identifier)
 
         @subscriptions[stream_identifier] = client.subscribe(self.class.subject_for(stream_identifier)) do |message, _subscription|
@@ -136,7 +166,12 @@ module Cable
           Cable.server.fiber_channel.send({stream_identifier, body})
           Cable::Logger.debug { "Cable::NATSBackend#subscribe channel:#{stream_identifier} message:#{body}" }
         end
+        @confirm_mutex.synchronize { @subscribed_seq += 1 }
       end
+
+      # Outside the mutex: the round trip parks this fiber on the network, and
+      # holding the lock would queue every other subscribe behind it.
+      confirm_subscription(stream_identifier, seq) if seq
     end
 
     # Stops streaming `stream_identifier`. Unknown identifiers are ignored —
@@ -157,14 +192,96 @@ module Cable
     def ping_subscribe_connection
       return if @closed
 
-      client.flush
+      round_trip!
     end
 
     # :ditto:
     def ping_publish_connection
       return if @closed
 
-      client.flush
+      round_trip!
+    end
+
+    # Waits until a PONG proves the server registered the SUB numbered `seq`.
+    # One confirming round trip is in flight at a time and it covers every SUB
+    # written before its PING, so a burst of new subscriptions shares a couple
+    # of PINGs instead of queueing one each (see `#round_trip!` for why that
+    # queue must stay short).
+    #
+    # Never raises: the SUB is already in the client's buffer and goes out on
+    # its next outbound tick (or is replayed on reconnect), so a failed round
+    # trip only loses the guarantee, and the log says so.
+    private def confirm_subscription(stream_identifier : String, seq : Int64) : Nil
+      loop do
+        round_trip, owner = @confirm_mutex.synchronize do
+          return if @closed || @confirmed_seq >= seq
+
+          if in_flight = @round_trip
+            {in_flight, false}
+          else
+            {@round_trip = RoundTrip.new(@subscribed_seq), true}
+          end
+        end
+
+        if owner
+          complete(round_trip)
+        else
+          round_trip.done.receive?
+        end
+
+        next unless error = round_trip.error
+
+        unless @closed
+          Cable::Logger.warn do
+            "Cable::NATSBackend#subscribe could not confirm the NATS subscription to #{stream_identifier} " \
+            "(#{error.message}); the SUB goes out with the next outbound flush, but messages " \
+            "published before the server registers it are not delivered to this node"
+          end
+        end
+        return
+      end
+    end
+
+    private def complete(round_trip : RoundTrip) : Nil
+      round_trip!
+      @confirm_mutex.synchronize { @confirmed_seq = round_trip.covers }
+    rescue ex : NATS::Error | IO::Error
+      round_trip.error = ex
+    ensure
+      @confirm_mutex.synchronize { @round_trip = nil }
+      round_trip.done.close
+    end
+
+    # Like `NATS::Client#flush` (PING, flush the output buffer, wait for the
+    # PONG), bounded by `FLUSH_TIMEOUT`, but it raises instead of sending a
+    # PING once `max_pings_out` PINGs are already unanswered.
+    #
+    # `NATS::Client#ping` queues its waiter on a channel sized
+    # `max_pings_out + 1` while holding the client's output lock. A PING sent
+    # once that queue is full blocks every write on the connection until the
+    # server answers, and the client's reconnect needs the same lock, so on a
+    # stalled connection this node would hang for good. The client's keepalive
+    # pings up to `max_pings_out + 1` and then reconnects; stopping one PING
+    # earlier (and serializing this backend's own PINGs) leaves room for a
+    # keepalive PING that races this one. The client keeps that accounting
+    # private, hence the instance variable reads.
+    private def round_trip! : Nil
+      pong = ::Channel(Nil).new(1)
+      @ping_mutex.synchronize do
+        unanswered = client.@ping_count.get
+        if unanswered >= client.@max_pings_out
+          raise NATS::Error.new("#{unanswered} PING(s) to the NATS server are still unanswered")
+        end
+
+        client.ping(pong)
+      end
+      client.flush!
+
+      select
+      when pong.receive
+      when timeout(FLUSH_TIMEOUT)
+        raise NATS::Error.new("no PONG from the NATS server within #{FLUSH_TIMEOUT}")
+      end
     end
 
     # Closing flushes and drains the connection, which can block indefinitely

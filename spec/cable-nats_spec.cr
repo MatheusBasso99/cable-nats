@@ -86,6 +86,17 @@ describe Cable::NATSBackend do
       Cable.server.backend.ping_subscribe_connection
       Cable.server.backend.ping_publish_connection
     end
+
+    it "raises from the keepalive hooks instead of pinging a stalled connection" do
+      with_dedicated_fake_nats do |server|
+        stall_connection(server)
+        pings = server.ping_count
+
+        expect_raises(NATS::Error, /unanswered/) { Cable.server.backend.ping_subscribe_connection }
+        expect_raises(NATS::Error, /unanswered/) { Cable.server.backend.ping_publish_connection }
+        server.ping_count.should eq(pings)
+      end
+    end
   end
 
   describe "internal channel" do
@@ -93,6 +104,7 @@ describe Cable::NATSBackend do
       Log.capture("cable", :debug) do |logs|
         settle_subscriptions
         Cable.server.publish(Cable::INTERNAL[:channel], "ping")
+        settle_subscriptions
         sleep 200.milliseconds
         logs.check(:debug, /PONG/)
       end
@@ -102,6 +114,7 @@ describe Cable::NATSBackend do
       Log.capture("cable", :debug) do |logs|
         settle_subscriptions
         Cable.server.publish(Cable::INTERNAL[:channel], "debug")
+        settle_subscriptions
         sleep 200.milliseconds
         logs.check(:debug, /Some Good Information/)
       end
@@ -122,7 +135,6 @@ describe Cable::NATSBackend do
         connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
         wait_for { socket.messages.includes?(confirmation(identifier)) }
 
-        settle_subscriptions
         json_message = %({"foo": "bar"})
         Cable.server.publish(channel: "chat_1", message: json_message)
         wait_for { socket.messages.includes?(stream_message(identifier, json_message)) }
@@ -140,7 +152,6 @@ describe Cable::NATSBackend do
         connection.receive({"command" => "subscribe", "identifier" => identifier_two}.to_json)
         wait_for { socket.messages.includes?(confirmation(identifier_two)) }
 
-        settle_subscriptions
         Cable.server.publish(channel: "chat_1", message: %({"n": 1}))
         Cable.server.publish(channel: "chat_2", message: %({"n": 2}))
 
@@ -178,7 +189,6 @@ describe Cable::NATSBackend do
         connection_two.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
         wait_for { socket_two.messages.includes?(confirmation(identifier)) }
 
-        settle_subscriptions
         json_message = %({"n": 1})
         Cable.server.publish(channel: "chat_1", message: json_message)
         wait_for { socket_one.messages.includes?(stream_message(identifier, json_message)) }
@@ -204,10 +214,136 @@ describe Cable::NATSBackend do
         connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
         wait_for { socket.messages.includes?(confirmation(identifier)) }
 
-        settle_subscriptions
         json_message = %({"foo": "bar"})
         Cable.server.publish(channel: "chat_#{room}", message: json_message)
         wait_for { socket.messages.includes?(stream_message(identifier, json_message)) }
+      end
+    end
+  end
+
+  describe "subscription confirmation" do
+    it "is only sent once the NATS server routes the stream to this node" do
+      # A second client, created up front: its publish travels on its own
+      # socket, so it cannot ride on the SUB the backend wrote ahead of it.
+      # Before `#subscribe` flushed, this spec failed reliably with a wide
+      # outbound interval (`NATS_FLUSH_INTERVAL_MS=500 crystal spec`).
+      publisher = NATS::Client.new(URI.parse(BackendEnvironment.url))
+
+      begin
+        connect do |connection, socket|
+          identifier = {channel: "ChatChannel", room: "1"}.to_json
+          connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
+          wait_for { socket.messages.includes?(confirmation(identifier)) }
+
+          json_message = %({"foo": "bar"})
+          publisher.publish(Cable::NATSBackend.subject_for("chat_1"), json_message)
+          publisher.flush
+          wait_for { socket.messages.includes?(stream_message(identifier, json_message)) }
+        end
+      ensure
+        publisher.close
+      end
+    end
+
+    it "costs one round trip per new identifier, none when already streaming" do
+      with_dedicated_fake_nats do |server|
+        backend = Cable.server.backend
+
+        # Exact counts are safe: the client's own keepalive PING fires every
+        # `NATS::Client::DEFAULT_PING_INTERVAL` (2 minutes), and
+        # `Cable::BackendPinger` is only started lazily, never in these specs.
+        pings = server.ping_count
+        backend.subscribe("chat_1")
+        server.ping_count.should eq(pings + 1)
+
+        backend.subscribe("chat_1")
+        server.ping_count.should eq(pings + 1)
+
+        backend.subscribe("chat_2")
+        server.ping_count.should eq(pings + 2)
+      end
+    end
+
+    it "shares round trips across a burst of new subscriptions" do
+      with_dedicated_fake_nats do |server|
+        publisher = NATS::Client.new(URI.parse(Cable.settings.url))
+
+        begin
+          connect do |connection, socket|
+            identifiers = (1..10).map { |room| {channel: "ChatChannel", room: room.to_s}.to_json }
+            pings = server.ping_count
+
+            identifiers.each do |identifier|
+              spawn { connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json) }
+            end
+            wait_for { identifiers.all? { |identifier| socket.messages.includes?(confirmation(identifier)) } }
+
+            # One PING for the first SUB, one more covering every SUB written
+            # while it was in flight.
+            server.ping_count.should be <= pings + 2
+
+            (1..10).each do |room|
+              publisher.publish(Cable::NATSBackend.subject_for("chat_#{room}"), %({"room": #{room}}))
+            end
+            publisher.flush
+            identifiers.each_with_index do |identifier, index|
+              wait_for { socket.messages.includes?(stream_message(identifier, %({"room": #{index + 1}}))) }
+            end
+          end
+        ensure
+          publisher.close
+        end
+      end
+    end
+
+    it "never blocks the connection when the server stops answering" do
+      with_dedicated_fake_nats do |server|
+        # As a stalled server would leave it after the client's own keepalive
+        # PINGs went unanswered: one more PING could fill the client's queue of
+        # pending PONGs and block every write on the connection.
+        stall_connection(server)
+        pings = server.ping_count
+
+        Log.capture("cable", :warn) do |logs|
+          5.times do |index|
+            within(500.milliseconds) { Cable.server.backend.subscribe("stalled_#{index}") }
+            logs.check(:warn, /could not confirm the NATS subscription to stalled_#{index}.*unanswered/)
+          end
+        end
+        within(500.milliseconds) { Cable.server.publish(channel: "stalled_0", message: "still writable") }
+        server.ping_count.should eq(pings)
+
+        # Once the late PONGs arrive, subscriptions are confirmed again.
+        server.mute_pongs = false
+        wait_for { Cable.server.backend_publish.@ping_count.get.zero? }
+        connect do |connection, socket|
+          pings = server.ping_count
+          identifier = {channel: "ChatChannel", room: "1"}.to_json
+          connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
+          socket.messages.should contain(confirmation(identifier))
+          server.ping_count.should eq(pings + 1)
+        end
+      end
+    end
+
+    it "logs and keeps the subscription when the flush fails" do
+      with_dedicated_fake_nats do |server|
+        connect do |connection, socket|
+          identifier = {channel: "ChatChannel", room: "1"}.to_json
+
+          Log.capture("cable", :warn) do |logs|
+            server.mute_pongs = true
+            connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
+            logs.check(:warn, /could not confirm the NATS subscription to chat_1/)
+          end
+          socket.messages.should contain(confirmation(identifier))
+
+          server.mute_pongs = false
+          settle_subscriptions
+          json_message = %({"foo": "bar"})
+          Cable.server.publish(channel: "chat_1", message: json_message)
+          wait_for { socket.messages.includes?(stream_message(identifier, json_message)) }
+        end
       end
     end
   end
@@ -226,7 +362,6 @@ describe Cable::NATSBackend do
             connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
             wait_for { socket.messages.includes?(confirmation(identifier)) }
 
-            settle_subscriptions
             Cable.server.publish(channel: "chat_1", message: %({"n": 1}))
             wait_for { socket.messages.includes?(stream_message(identifier, %({"n": 1}))) }
 
@@ -298,12 +433,60 @@ private def stream_message(identifier : String, json_message : String) : String
   {"identifier" => identifier, "message" => JSON.parse(json_message)}.to_json
 end
 
-# Round-trips the shared client so every SUB written so far is guaranteed to
-# have been processed by the NATS server before we publish to it.
+# Round-trips the shared client so every command written so far is guaranteed
+# to have been processed by the NATS server before we publish. `#subscribe`
+# already does this for stream subscriptions; it is still needed for the
+# internal channel (subscribed from a fiber spawned at boot, with no flush),
+# for UNSUB, and after a subscribe whose own flush failed.
 private def settle_subscriptions
   client = Cable.server.backend_publish
   Fiber.yield
   client.flush
+end
+
+# Leaves the backend's client with `max_pings_out` PINGs the server has not
+# answered, and keeps the server from answering until `mute_pongs` is lifted.
+private def stall_connection(server : FakeNATSServer)
+  client = Cable.server.backend_publish
+  server.mute_pongs = true
+  client.@max_pings_out.times { client.ping(Channel(Nil).new(1)) }
+  client.flush!
+  wait_for { server.ping_count >= client.@max_pings_out }
+end
+
+# Fails unless the block returns within `timeout`.
+private def within(timeout : Time::Span, &block)
+  done = Channel(Nil).new(1)
+  spawn do
+    block.call
+  ensure
+    done.send(nil)
+  end
+
+  select
+  when done.receive
+  when timeout(timeout)
+    fail "still blocked after #{timeout}"
+  end
+end
+
+# Points Cable at a dedicated `FakeNATSServer` for the block, in both modes,
+# for specs that observe or perturb the server side of the connection.
+private def with_dedicated_fake_nats(&)
+  server = FakeNATSServer.new
+  original_url = Cable.settings.url
+
+  begin
+    Cable.settings.url = "nats://127.0.0.1:#{server.port}"
+    Cable.restart
+    yield server
+  ensure
+    # Restore while the fake server still answers, so the client closes cleanly.
+    server.mute_pongs = false
+    Cable.settings.url = original_url
+    Cable.restart
+    server.stop
+  end
 end
 
 # Yields a NATS URL plus a proc that restarts the server behind it, dropping

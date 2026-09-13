@@ -77,6 +77,40 @@ end
 > NOTE: An error log `Cable.restart` will be invoked whenever a restart happens.
 > We highly advise you to monitor these logs.
 
+### Subscription confirm means listening
+
+The NATS client does not write each command to the socket: it buffers them and
+flushes every 10 ms (`NATS_FLUSH_INTERVAL_MS`). Cable sends
+`confirm_subscription` to the WebSocket client as soon as the backend's
+`subscribe` returns, so without help a broadcast from another process (a
+background worker, say) could reach the NATS server in that window, before the
+`SUB`, and be dropped for this node while the client believed it was listening.
+
+So for every new stream identifier, `subscribe` waits for a PING/PONG round trip
+before it returns. The server handles a connection's commands in order, so the
+`PONG` proves it has registered the subscription: by the time the client sees
+the confirmation, a broadcast from any process reaches it.
+
+- **Cost:** one round trip per new stream identifier per process, not per
+  viewer. Identifiers the node already streams return immediately. That
+  includes the `cable_internal/<identifier>` stream every connection opens, so
+  an identified user's first connection to a node pays one too. Concurrent
+  subscriptions share round trips: one is in flight at a time, and its `PONG`
+  covers every `SUB` written before its `PING`.
+- **If the server does not answer** within `Cable::NATSBackend::FLUSH_TIMEOUT`
+  (2 seconds), `subscribe` logs a warning through `Cable::Logger` and returns.
+  The subscription itself is not lost: the `SUB` is already buffered and goes
+  out on the next outbound flush (or is replayed on reconnect). Only the
+  guarantee is lost, for messages published before the server registers it.
+- **A stalled connection never blocks.** Once `max_pings_out` (2) PINGs are
+  unanswered, the backend sends no more: `subscribe` warns and returns at once,
+  and `ping_subscribe_connection`/`ping_publish_connection` raise. One more PING
+  could fill the client's bounded queue of pending PONGs, and the client waits
+  for room while holding the lock every write (and its own reconnect) needs.
+- **Scope:** the guarantee holds for the NATS server this node is connected to.
+  In a cluster, interest propagates between servers asynchronously, so a
+  broadcast published through another server in that interval can still miss.
+
 ### Stream identifiers are sanitized into NATS subjects
 
 NATS subjects cannot contain whitespace or the reserved characters `.` (token
@@ -123,8 +157,20 @@ CABLE_BACKEND_URL=nats://localhost:4222 crystal spec
 In integration mode the reconnection spec restarts a real `nats-server` inside
 a Docker container; it is marked pending when Docker is unavailable.
 
+Streaming specs publish as soon as the subscription is confirmed, with no
+settling, because that is the guarantee described above. Widening the client's
+outbound interval makes a regression fail reliably instead of occasionally:
+
+```sh
+NATS_FLUSH_INTERVAL_MS=500 crystal spec
+```
+
+The spec helper `settle_subscriptions` is only for writes nothing confirms on
+its own: the internal channel (subscribed from a fiber spawned at boot), UNSUB,
+and a subscribe whose round trip failed.
+
 1. Make the update
-2. Add a spec and run `crystal spec`
+2. Add a spec and run `crystal spec` (and `NATS_FLUSH_INTERVAL_MS=500 crystal spec`)
 3. Format it `crystal tool format spec/ src/`
 4. Ameba `./bin/ameba`
 5. Commit it
