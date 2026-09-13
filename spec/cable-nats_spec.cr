@@ -99,6 +99,52 @@ describe Cable::NATSBackend do
     end
   end
 
+  describe "keepalive" do
+    it "runs the client's PINGs on backend_ping_interval" do
+      Cable.server.backend_publish.@ping_interval.should eq(Cable.settings.backend_ping_interval)
+    end
+
+    it "reconnects on its own when the server stops answering, without Cable.restart" do
+      original_interval = Cable.settings.backend_ping_interval
+      Cable.settings.backend_ping_interval = 100.milliseconds
+
+      begin
+        with_dedicated_fake_nats do |server|
+          publisher = NATS::Client.new(URI.parse(Cable.settings.url))
+
+          begin
+            connect do |connection, socket|
+              identifier = {channel: "ChatChannel", room: "1"}.to_json
+              connection.receive({"command" => "subscribe", "identifier" => identifier}.to_json)
+              wait_for { socket.messages.includes?(confirmation(identifier)) }
+              cable_server = Cable.server
+              accepted = server.connections_accepted
+
+              # A stall that leaves the TCP connection open: only the client's
+              # unanswered keepalive PINGs can reveal it.
+              server.mute_pongs = true
+              wait_for { server.connections_accepted > accepted }
+              # The reconnect handshake waits for its own PONG.
+              server.mute_pongs = false
+
+              wait_for do
+                publisher.publish(Cable::NATSBackend.subject_for("chat_1"), %({"n": 1}))
+                publisher.flush
+                socket.messages.includes?(stream_message(identifier, %({"n": 1})))
+              end
+              Cable.server.should be(cable_server)
+              socket.closed?.should be_false
+            end
+          ensure
+            publisher.close
+          end
+        end
+      ensure
+        Cable.settings.backend_ping_interval = original_interval
+      end
+    end
+  end
+
   describe "internal channel" do
     it "answers internal ping broadcasts with a PONG log" do
       Log.capture("cable", :debug) do |logs|
@@ -250,7 +296,7 @@ describe Cable::NATSBackend do
         backend = Cable.server.backend
 
         # Exact counts are safe: the client's own keepalive PING fires every
-        # `NATS::Client::DEFAULT_PING_INTERVAL` (2 minutes), and
+        # `backend_ping_interval` (10 minutes in spec_helper), and
         # `Cable::BackendPinger` is only started lazily, never in these specs.
         pings = server.ping_count
         backend.subscribe("chat_1")

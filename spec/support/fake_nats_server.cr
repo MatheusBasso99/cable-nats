@@ -54,6 +54,7 @@ class FakeNATSServer
   @connections = [] of Connection
   @mutex = Mutex.new
   @ping_count = Atomic(Int32).new(0)
+  @connections_accepted = Atomic(Int32).new(0)
   @mute_pongs = false
   @held_pongs = [] of Connection
 
@@ -69,6 +70,12 @@ class FakeNATSServer
   # started. Each `NATS::Client#flush` sends exactly one.
   def ping_count : Int32
     @ping_count.get
+  end
+
+  # Number of client connections accepted since the server started, including
+  # reconnections.
+  def connections_accepted : Int32
+    @connections_accepted.get
   end
 
   # While muted, `PING` is still read and counted but its `PONG` is held back,
@@ -117,6 +124,7 @@ class FakeNATSServer
     socket.sync = false
     connection = Connection.new(socket)
     @mutex.synchronize { @connections << connection }
+    @connections_accepted.add(1)
 
     spawn do
       connection.send_line "INFO #{info_json}"

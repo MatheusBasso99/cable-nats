@@ -60,22 +60,30 @@ between `subscribe_connection` and `publish_connection`.
 
 The NATS client exchanges protocol PING/PONG on its own timer, and when the
 connection drops it reconnects automatically, re-establishes every subscription,
-and replays writes buffered during the outage. You do not need to configure
-anything to get this.
+and replays writes buffered during the outage. No WebSocket is closed and
+`Cable.restart` is not involved.
 
-Cable's own backend pinger still runs and is still useful: this backend answers
-`ping_subscribe_connection`/`ping_publish_connection` with a round-trip flush, so
-a dead connection surfaces as an error and feeds Cable's restart logic.
+This backend runs that keepalive on `backend_ping_interval`:
 
 ```crystal
 Cable.configure do |settings|
-  settings.backend_ping_interval = 15.seconds # default is 15.
-  settings.restart_error_allowance = 20       # default is 20. Use 0 to disable restarts
+  settings.backend_ping_interval = 15.seconds # default is 15
 end
 ```
 
-> NOTE: An error log `Cable.restart` will be invoked whenever a restart happens.
-> We highly advise you to monitor these logs.
+- **A connection that closes** (the server restarts, the TCP connection
+  resets) is noticed at once and reconnected.
+- **A connection that stalls without closing** is noticed by its unanswered
+  PINGs: the client reconnects once more than two are outstanding, so within
+  three to four intervals (45 to 60 seconds at the default). Without this
+  setting the client would PING every 2 minutes and take 6 to 8.
+
+Cable's backend pinger (`Cable::BackendPinger`) is not started by Cable itself,
+so neither it nor `restart_error_allowance` watches this backend. If you start
+it, `ping_subscribe_connection`/`ping_publish_connection` answer with a bounded
+round-trip flush. A failure there stops the pinger and counts toward
+`Cable.restart`, which closes every WebSocket on the node: for NATS the
+client's own reconnect already recovers without that.
 
 ### Subscription confirm means listening
 

@@ -8,8 +8,11 @@ module Cable
   # Unlike Redis, NATS multiplexes publishing and subscribing over a single
   # socket, so one shared `NATS::Client` serves as both the subscribe and the
   # publish connection. Keepalive (protocol PING/PONG) and reconnection with
-  # automatic resubscription are built into the client, so the `ping_*` hooks
-  # only need to flush the connection to prove liveness to `Cable::BackendPinger`.
+  # automatic resubscription are built into the client: it PINGs every
+  # `Cable.settings.backend_ping_interval` and reconnects on its own once more
+  # than two PINGs go unanswered, without `Cable.restart` and without dropping
+  # a WebSocket. The `ping_*` hooks only flush the connection, for whatever calls
+  # them (`Cable::BackendPinger`, when an app starts it).
   #
   # Enable it by pointing Cable at a NATS server:
   #
@@ -20,7 +23,7 @@ module Cable
   # end
   # ```
   class NATSBackend < Cable::BackendCore
-    VERSION = "0.1.1"
+    VERSION = "0.1.2"
 
     register "nats" # nats://
     register "tls"  # tls:// (NATS over TLS)
@@ -31,7 +34,14 @@ module Cable
     # escape character so the encoding stays reversible.
     private RESERVED_SUBJECT_CHARS = {'.', '*', '>', '%'}
 
-    private getter client : NATS::Client = NATS::Client.new(URI.parse(Cable.settings.url))
+    # The client's own keepalive runs on `backend_ping_interval`: Cable does not
+    # start its backend pinger, and the client's default (2 minutes, reconnecting
+    # after more than two unanswered PINGs) would take 6 to 8 minutes to notice a
+    # connection that stalled without closing.
+    private getter client : NATS::Client = NATS::Client.new(
+      URI.parse(Cable.settings.url),
+      ping_interval: Cable.settings.backend_ping_interval,
+    )
 
     # How long this backend waits for the server to answer a PING: the round
     # trip that confirms new subscriptions in `#subscribe`, and the keepalive

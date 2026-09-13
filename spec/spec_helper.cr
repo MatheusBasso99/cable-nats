@@ -37,7 +37,10 @@ Cable.configure do |settings|
   settings.token = "test_token"
   settings.url = BackendEnvironment.url
   settings.backend_class = Cable::NATSBackend
-  settings.backend_ping_interval = 2.seconds
+  # Also the NATS client's keepalive interval. Specs count PINGs exactly and
+  # hold PONGs back for seconds, so keep the client's own PINGs out of them;
+  # the keepalive spec lowers it for itself.
+  settings.backend_ping_interval = 10.minutes
   settings.restart_error_allowance = 2
 end
 
