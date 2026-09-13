@@ -319,10 +319,10 @@ private def with_restartable_nats(&)
     docker!("run", "-d", "--rm", "--name", container, "-p", "14222:4222", "nats:latest")
 
     begin
-      wait_for_port(14222)
+      wait_for_nats(14222)
       yield "nats://localhost:14222", -> do
         docker!("restart", container)
-        wait_for_port(14222)
+        wait_for_nats(14222)
         # Give the client a moment to notice the drop before writing again.
         sleep 2.seconds
       end
@@ -348,12 +348,18 @@ private def wait_for(timeout : Time::Span = 5.seconds, &)
   end
 end
 
-private def wait_for_port(port : Int32)
+# Waits until a NATS server greets clients on `port`. A TCP connect alone is
+# not enough: Docker's port proxy accepts connections before the server inside
+# the container listens, then closes them without sending INFO.
+private def wait_for_nats(port : Int32)
   wait_for(timeout: 15.seconds) do
-    TCPSocket.new("localhost", port, connect_timeout: 500.milliseconds).close
-    true
-  rescue Socket::Error | IO::TimeoutError
+    socket = TCPSocket.new("localhost", port, connect_timeout: 500.milliseconds)
+    socket.read_timeout = 500.milliseconds
+    socket.read_line.starts_with?("INFO")
+  rescue Socket::Error | IO::Error
     false
+  ensure
+    socket.try(&.close)
   end
 end
 
