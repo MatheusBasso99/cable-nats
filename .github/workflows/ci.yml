@@ -15,7 +15,7 @@ jobs:
         shard_file:
           - shard.yml
         crystal_version:
-          - 1.10.0
+          - 1.19.0
           - latest
         experimental:
           - false
@@ -36,6 +36,8 @@ jobs:
         run: shards install
       - name: Format
         run: crystal tool format --check
+      - name: Build ameba
+        run: mkdir -p bin && crystal build -o bin/ameba lib/ameba/bin/ameba.cr
       - name: Lint
         run: ./bin/ameba
       - name: Run tests

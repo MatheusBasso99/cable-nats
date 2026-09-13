@@ -172,7 +172,7 @@ and a subscribe whose round trip failed.
 1. Make the update
 2. Add a spec and run `crystal spec` (and `NATS_FLUSH_INTERVAL_MS=500 crystal spec`)
 3. Format it `crystal tool format spec/ src/`
-4. Ameba `./bin/ameba`
+4. Ameba `./bin/ameba` (build it once after `shards install`: `mkdir -p bin && crystal build -o bin/ameba lib/ameba/bin/ameba.cr`)
 5. Commit it
 6. GO TO 1
 
